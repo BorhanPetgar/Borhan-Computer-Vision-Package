@@ -4,6 +4,228 @@ import re
 from tqdm import tqdm
 import numpy as np
 
+def create_patches(image, patch_size=100, overlap=0):
+    """
+    Split image into patches of specified size with optional overlap.
+    
+    Args:
+        image: Input image (numpy array)
+        patch_size: Size of each patch (square)
+        overlap: Overlap between adjacent patches in pixels
+        
+    Returns:
+        Tuple of (patches, patch_positions) where patches is a list of image patches
+        and patch_positions is a list of (x, y) coordinates for top-left corner of each patch
+    """
+    height, width = image.shape[:2]
+    patches = []
+    patch_positions = []
+    
+    stride = patch_size - overlap
+    
+    for y in range(0, height - patch_size + 1, stride):
+        for x in range(0, width - patch_size + 1, stride):
+            patch = image[y:y+patch_size, x:x+patch_size].copy()
+            patches.append(patch)
+            patch_positions.append((x, y))
+    
+    return patches, patch_positions
+
+
+def draw_boxes(image, boxes, classes=None, confidences=None, colors=None, class_names=None):
+    """
+    Draw bounding boxes on an image.
+    
+    Args:
+        image: Input image (numpy array)
+        boxes: List of boxes in format [x1, y1, x2, y2]
+        classes: List of class IDs for each box (optional)
+        confidences: List of confidence scores for each box (optional)
+        colors: Dictionary mapping class IDs to colors, or a single color for all boxes
+        class_names: Dictionary mapping class IDs to class names
+        
+    Returns:
+        Image with drawn bounding boxes
+    """
+    image_with_boxes = image.copy()
+    
+    if colors is None:
+        # Generate random colors if not provided
+        np.random.seed(42)
+        colors = np.random.randint(0, 255, size=(100, 3), dtype="uint8")
+    
+    for i, box in enumerate(boxes):
+        x1, y1, x2, y2 = [int(coord) for coord in box]
+        
+        # Determine color
+        if isinstance(colors, dict) and classes is not None:
+            color = colors.get(classes[i], (0, 255, 0))
+        elif isinstance(colors, (list, np.ndarray)) and classes is not None:
+            color = tuple(map(int, colors[classes[i] % len(colors)]))
+        else:
+            color = (0, 255, 0) if not isinstance(colors, tuple) else colors
+        
+        # Draw box
+        cv2.rectangle(image_with_boxes, (x1, y1), (x2, y2), color, 2)
+        
+        # Draw label if class information is available
+        if classes is not None:
+            cls_id = classes[i]
+            
+            label_parts = []
+            
+            # Add class name if available
+            if class_names and cls_id in class_names:
+                label_parts.append(f"{class_names[cls_id]}")
+            else:
+                label_parts.append(f"Class {cls_id}")
+                
+            # Add confidence if available
+            if confidences is not None:
+                label_parts.append(f"{confidences[i]:.2f}")
+                
+            label = ": ".join(label_parts)
+            
+            # Position the label
+            y = y1 - 10 if y1 - 10 > 10 else y1 + 20
+            cv2.putText(image_with_boxes, label, (x1, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    return image_with_boxes
+
+
+def run_yolo_inference(model, image, conf_threshold=0.25, patch_size=None, overlap=0):
+    """
+    Run YOLO inference on an image, with optional patching for large images.
+    
+    Args:
+        model: YOLO model instance from ultralytics
+        image: Input image (numpy array)
+        conf_threshold: Confidence threshold for detections
+        patch_size: If not None, split image into patches of this size
+        overlap: Overlap between patches in pixels (only if patch_size is specified)
+        
+    Returns:
+        Tuple of (boxes, classes, confidences) where:
+            boxes: numpy array of bounding boxes in [x1, y1, x2, y2] format
+            classes: numpy array of class IDs
+            confidences: numpy array of confidence scores
+    """
+    if patch_size is None:
+        # Run on the whole image
+        results = model(image)
+        
+        boxes = []
+        classes = []
+        confidences = []
+        
+        for result in results:
+            if len(result.boxes) > 0:
+                for box in result.boxes:
+                    if box.conf >= conf_threshold:
+                        boxes.append(box.xyxy.cpu().numpy()[0])
+                        classes.append(int(box.cls.cpu().numpy()[0]))
+                        confidences.append(float(box.conf.cpu().numpy()[0]))
+        
+        return (np.array(boxes) if boxes else np.empty((0, 4))), \
+               (np.array(classes) if classes else np.array([])), \
+               (np.array(confidences) if confidences else np.array([]))
+    else:
+        # Run on patches
+        patches, patch_positions = create_patches(image, patch_size, overlap)
+        
+        all_boxes = []
+        all_classes = []
+        all_confidences = []
+        
+        for i, patch in enumerate(patches):
+            x_offset, y_offset = patch_positions[i]
+            
+            # Run inference on the patch
+            results = model(patch)
+            
+            for result in results:
+                if len(result.boxes) > 0:
+                    for box in result.boxes:
+                        if box.conf >= conf_threshold:
+                            # Get box coordinates and adjust to original image
+                            x1, y1, x2, y2 = box.xyxy.cpu().numpy()[0]
+                            
+                            x1 += x_offset
+                            y1 += y_offset
+                            x2 += x_offset
+                            y2 += y_offset
+                            
+                            all_boxes.append([x1, y1, x2, y2])
+                            all_classes.append(int(box.cls.cpu().numpy()[0]))
+                            all_confidences.append(float(box.conf.cpu().numpy()[0]))
+        
+        return (np.array(all_boxes) if all_boxes else np.empty((0, 4))), \
+               (np.array(all_classes) if all_classes else np.array([])), \
+               (np.array(all_confidences) if all_confidences else np.array([]))
+               
+
+def non_max_suppression(boxes, scores, iou_threshold=0.5):
+    """
+    Apply non-maximum suppression to remove overlapping bounding boxes.
+    
+    Args:
+        boxes: List of bounding boxes in format [x1, y1, x2, y2]
+        scores: List of confidence scores for each box
+        iou_threshold: IoU threshold for considering boxes as duplicates
+        
+    Returns:
+        List of indices of boxes to keep
+    """
+    # If no boxes, return empty list
+    if len(boxes) == 0:
+        return []
+    
+    # Convert to numpy arrays if they aren't already
+    if isinstance(boxes, list):
+        boxes = np.array(boxes)
+    if isinstance(scores, list):
+        scores = np.array(scores)
+    
+    # Get coordinates of bounding boxes
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    
+    # Calculate area of each box
+    areas = (x2 - x1) * (y2 - y1)
+    
+    # Sort by confidence score
+    order = scores.argsort()[::-1]
+    
+    keep = []
+    while order.size > 0:
+        # Pick the box with highest confidence
+        i = order[0]
+        keep.append(i)
+        
+        # Find IoU with rest of the boxes
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        
+        # Compute width and height of intersection
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+        
+        # Compute IoU
+        intersection = w * h
+        union = areas[i] + areas[order[1:]] - intersection
+        iou = intersection / union
+        
+        # Keep boxes with IoU less than threshold
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    
+    return keep
+
 
 def print_dict(dictionary):
     for key, value in dictionary.items():
